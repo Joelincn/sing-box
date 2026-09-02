@@ -224,13 +224,14 @@ func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManage
 					firstErr = r.err
 				}
 
-				// Return as soon as the highest-priority (smallest order) success
-				// so far is available, starting from the preferred server.
+				// Return the highest-priority success received so far, WITHOUT
+				// waiting for a higher-priority server that is still slow.
 				for i := 0; i < serverCount; i++ {
 					res := results[i]
 					if res == nil {
-						// A higher-priority server has not responded yet; wait for it.
-						break
+						// Not received yet; skip it and prefer whichever
+						// server has already succeeded.
+						continue
 					}
 					if res.err == nil && res.response != nil {
 						t.logger.DebugContext(ctx, "round-robin success from ", res.tag)
