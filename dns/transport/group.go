@@ -2,7 +2,9 @@ package transport
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -16,8 +18,9 @@ import (
 )
 
 const (
-	StrategyConcurrent = "concurrent"
-	StrategyRoundRobin = "round_robin"
+	StrategyConcurrent  = "concurrent"
+	StrategyRoundRobin  = "round_robin"
+	defaultQueryTimeout = 5 * time.Second
 )
 
 var _ adapter.DNSTransport = (*GroupTransport)(nil)
@@ -40,7 +43,7 @@ func NewGroup(ctx context.Context, logger log.ContextLogger, tag string, options
 	if len(options.Servers) == 0 {
 		return nil, E.New("missing servers")
 	}
-	
+
 	strategy := options.Strategy
 	if strategy == "" {
 		strategy = StrategyConcurrent
@@ -48,7 +51,7 @@ func NewGroup(ctx context.Context, logger log.ContextLogger, tag string, options
 	if strategy != StrategyConcurrent && strategy != StrategyRoundRobin {
 		return nil, E.New("invalid strategy: ", strategy, ", must be 'concurrent' or 'round_robin'")
 	}
-	
+
 	return &GroupTransport{
 		TransportAdapter: dns.NewTransportAdapter(C.DNSTypeGroup, tag, options.Servers),
 		ctx:              ctx,
@@ -117,7 +120,7 @@ func (t *GroupTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, c
 	}
 }
 
-// exchangeConcurrent 并发查询所有服务器，返回最快的响应（原有逻辑）
+// exchangeConcurrent 并发查询所有服务器，返回最快的响应
 func (t *GroupTransport) exchangeConcurrent(ctx context.Context, transportManager adapter.DNSTransportManager, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
 	type result struct {
 		response *mDNS.Msg
@@ -125,110 +128,183 @@ func (t *GroupTransport) exchangeConcurrent(ctx context.Context, transportManage
 		err      error
 	}
 
-	resultCh := make(chan result, len(t.serverTags))
-	ctx, cancel := context.WithCancel(ctx)
+	serverCount := len(t.serverTags)
+	resultCh := make(chan result, serverCount)
 
+	// Create a cancellable context with timeout
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Track if callback has been called to avoid double-callback
+	var callbackOnce sync.Once
+
+	// Launch all queries concurrently
 	for _, tag := range t.serverTags {
 		transport, loaded := transportManager.Transport(tag)
 		if !loaded {
 			resultCh <- result{nil, tag, E.New("DNS server not found: ", tag)}
 			continue
 		}
-		transport.ExchangeAsync(ctx, message.Copy(), func(response *mDNS.Msg, err error) {
+
+		// Create a timeout context for this specific query
+		queryCtx, queryCancel := context.WithTimeout(ctx, defaultQueryTimeout)
+
+		transport.ExchangeAsync(queryCtx, message.Copy(), func(response *mDNS.Msg, err error) {
+			queryCancel()
 			resultCh <- result{response, tag, err}
 		})
 	}
 
+	// Goroutine to collect results and return the first successful one
 	go func() {
 		var firstErr error
-		for range t.serverTags {
-			r := <-resultCh
-			if r.err == nil && r.response != nil {
-				t.logger.DebugContext(ctx, "fastest response from ", r.tag)
-				cancel()
-				callback(r.response, nil)
+
+		for i := 0; i < serverCount; i++ {
+			select {
+			case r := <-resultCh:
+				if r.err == nil && r.response != nil {
+					t.logger.DebugContext(ctx, "concurrent: fastest response from ", r.tag)
+					cancel() // Cancel other queries
+					callbackOnce.Do(func() {
+						callback(r.response, nil)
+					})
+					return
+				}
+
+				if r.err != nil {
+					t.logger.DebugContext(ctx, "concurrent: ", r.tag, " failed: ", r.err)
+					if firstErr == nil {
+						firstErr = r.err
+					}
+				}
+
+			case <-ctx.Done():
+				// Parent context cancelled
+				callbackOnce.Do(func() {
+					callback(nil, ctx.Err())
+				})
 				return
-			}
-			if firstErr == nil && r.err != nil {
-				firstErr = r.err
 			}
 		}
 
-		cancel()
-		if firstErr != nil {
-			callback(nil, firstErr)
-		} else {
-			callback(nil, E.New("all DNS servers failed"))
-		}
+		// All servers responded, but all failed
+		t.logger.DebugContext(ctx, "concurrent: all ", serverCount, " servers failed")
+		callbackOnce.Do(func() {
+			if firstErr != nil {
+				callback(nil, firstErr)
+			} else {
+				callback(nil, E.New("all DNS servers failed"))
+			}
+		})
 	}()
 }
 
-// exchangeRoundRobin 轮询查询，每次选择下一个服务器，失败时自动尝试下一个
+// exchangeRoundRobin 轮询查询，并发尝试多个服务器，优先使用轮询索引对应的服务器
 func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManager adapter.DNSTransportManager, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
 	serverCount := uint32(len(t.serverTags))
-	var lastErr error
-	
-	// 原子性地获取并递增轮询索引，避免并发竞态
+
+	// Atomically get and increment round-robin index
 	startIndex := t.rrIndex.Add(1) - 1
-	
-	// 尝试所有服务器，从当前轮询索引开始
+
+	// Create a cancellable context with timeout
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		response *mDNS.Msg
+		tag      string
+		err      error
+		index    uint32
+	}
+
+	resultCh := make(chan result, serverCount)
+	var callbackOnce sync.Once
+
+	// Launch all queries concurrently, prioritized by round-robin order
 	for i := uint32(0); i < serverCount; i++ {
-		// 检查 context 是否已被取消
-		select {
-		case <-ctx.Done():
-			callback(nil, ctx.Err())
-			return
-		default:
-		}
-		
-		// 获取当前轮询索引对应的服务器
 		index := (startIndex + i) % serverCount
 		tag := t.serverTags[index]
-		
+
 		transport, loaded := transportManager.Transport(tag)
 		if !loaded {
-			lastErr = E.New("DNS server not found: ", tag)
-			t.logger.DebugContext(ctx, "round-robin skip (not found): ", tag)
+			resultCh <- result{nil, tag, E.New("DNS server not found: ", tag), index}
 			continue
 		}
-		
-		// 尝试查询当前服务器
-		var response *mDNS.Msg
-		var err error
-		done := make(chan struct{})
-		
-		transport.ExchangeAsync(ctx, message.Copy(), func(resp *mDNS.Msg, e error) {
-			response = resp
-			err = e
-			close(done)
-		})
-		
-		// 等待查询完成或 context 取消
-		select {
-		case <-done:
-			// 查询完成，继续处理
-		case <-ctx.Done():
-			// Context 被取消，立即返回
-			callback(nil, ctx.Err())
-			return
-		}
-		
-		if err == nil && response != nil {
-			// 成功
-			t.logger.DebugContext(ctx, "round-robin success from ", tag)
-			callback(response, nil)
-			return
-		}
-		
-		// 失败，记录错误并继续尝试下一个
-		lastErr = err
-		t.logger.DebugContext(ctx, "round-robin failed: ", tag, ", error: ", err)
+
+		// Create a timeout context for this specific query
+		queryCtx, queryCancel := context.WithTimeout(ctx, defaultQueryTimeout)
+
+		go func(idx uint32, tr adapter.DNSTransport, queryTag string) {
+			defer queryCancel()
+			tr.ExchangeAsync(queryCtx, message.Copy(), func(response *mDNS.Msg, err error) {
+				resultCh <- result{response, queryTag, err, idx}
+			})
+		}(index, transport, tag)
 	}
-	
-	// 所有服务器都失败
-	if lastErr != nil {
-		callback(nil, lastErr)
-	} else {
-		callback(nil, E.New("all DNS servers failed"))
-	}
+
+	// Goroutine to collect results
+	go func() {
+		var (
+			bestResponse *mDNS.Msg
+			bestTag      string
+			bestIndex    uint32 = serverCount // Higher than any valid index
+			firstErr     error
+			resultCount  int
+		)
+
+		for resultCount < int(serverCount) {
+			select {
+			case r := <-resultCh:
+				resultCount++
+
+				if r.err == nil && r.response != nil {
+					// Success! Prefer lower index (closer to round-robin position)
+					if r.index < bestIndex {
+						bestResponse = r.response
+						bestTag = r.tag
+						bestIndex = r.index
+						t.logger.DebugContext(ctx, "round-robin: success from ", r.tag, " (index ", r.index, ")")
+
+						// If this is the highest priority server, return immediately
+						if r.index == startIndex%serverCount {
+							cancel()
+							callbackOnce.Do(func() {
+								callback(bestResponse, nil)
+							})
+							return
+						}
+					}
+				} else {
+					t.logger.DebugContext(ctx, "round-robin: ", r.tag, " failed: ", r.err)
+					if firstErr == nil && r.err != nil {
+						firstErr = r.err
+					}
+				}
+
+			case <-ctx.Done():
+				// Parent context cancelled
+				callbackOnce.Do(func() {
+					callback(nil, ctx.Err())
+				})
+				return
+			}
+		}
+
+		// All queries completed
+		if bestResponse != nil {
+			t.logger.DebugContext(ctx, "round-robin: returning best response from ", bestTag)
+			callbackOnce.Do(func() {
+				callback(bestResponse, nil)
+			})
+		} else {
+			t.logger.DebugContext(ctx, "round-robin: all servers failed")
+			callbackOnce.Do(func() {
+				if firstErr != nil {
+					callback(nil, firstErr)
+				} else {
+					callback(nil, E.New("all DNS servers failed"))
+				}
+			})
+		}
+	}()
 }
