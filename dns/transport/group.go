@@ -2,8 +2,8 @@ package transport
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -165,93 +165,47 @@ func (t *GroupTransport) exchangeConcurrent(ctx context.Context, transportManage
 	}()
 }
 
-// exchangeRoundRobin queries all servers concurrently, but returns responses in
-// round-robin priority order. Each request advances the round-robin index, so
-// concurrent requests are distributed across servers for load balancing, while
-// still failing over to the next server when the preferred one fails.
+// exchangeRoundRobin implements true round-robin load balancing: each request
+// queries only the preferred server (selected by round-robin index), and only
+// falls back to the next server if the preferred one fails. This ensures that
+// N concurrent requests are distributed across N servers for even load
+// distribution, minimizing resource usage when servers have query limits.
 func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManager adapter.DNSTransportManager, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
 	serverCount := len(t.serverTags)
+	startIndex := int(t.rrIndex.Add(1)-1) % serverCount
 
-	// Atomically advance the round-robin index and pick the preferred server.
-	preferred := int(t.rrIndex.Add(1)-1) % serverCount
+	var lastErr error
 
-	type result struct {
-		response *mDNS.Msg
-		tag      string
-		err      error
-		order    int // position in the round-robin sequence (0 == preferred)
-	}
-
-	resultCh := make(chan result, serverCount)
-	ctx, cancel := context.WithCancel(ctx)
-
-	// Fire off all queries concurrently, tagging each with its round-robin order.
+	// Try each server in round-robin order, stopping at the first success.
 	for i := 0; i < serverCount; i++ {
-		order := (preferred + i) % serverCount
-		tag := t.serverTags[order]
-
+		index := (startIndex + i) % serverCount
+		tag := t.serverTags[index]
 		transport, loaded := transportManager.Transport(tag)
 		if !loaded {
-			resultCh <- result{nil, tag, E.New("DNS server not found: ", tag), i}
+			t.logger.DebugContext(ctx, "round-robin: server not found: ", tag)
 			continue
 		}
-		transport.ExchangeAsync(ctx, message.Copy(), func(response *mDNS.Msg, err error) {
-			resultCh <- result{response, tag, err, i}
-		})
+
+		// Query only this server (not all servers concurrently).
+		// Use a per-server timeout to avoid blocking too long on a slow server.
+		serverCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		response, err := transport.Exchange(serverCtx, message.Copy())
+		cancel()
+
+		if err == nil && response != nil {
+			t.logger.DebugContext(ctx, "round-robin success from ", tag)
+			callback(response, nil)
+			return
+		}
+
+		lastErr = err
+		t.logger.DebugContext(ctx, "round-robin failed from ", tag, ": ", err, ", trying next")
 	}
 
-	go func() {
-		var callbackOnce sync.Once
-		finish := func(response *mDNS.Msg, err error) {
-			callbackOnce.Do(func() {
-				cancel()
-				callback(response, err)
-			})
-		}
-
-		// Collected results, indexed by round-robin order.
-		results := make([]*result, serverCount)
-		received := 0
-		var firstErr error
-
-		for received < serverCount {
-			select {
-			case r := <-resultCh:
-				received++
-				results[r.order] = &r
-
-				if r.err != nil && firstErr == nil {
-					firstErr = r.err
-				}
-
-				// Return the highest-priority success received so far, WITHOUT
-				// waiting for a higher-priority server that is still slow.
-				for i := 0; i < serverCount; i++ {
-					res := results[i]
-					if res == nil {
-						// Not received yet; skip it and prefer whichever
-						// server has already succeeded.
-						continue
-					}
-					if res.err == nil && res.response != nil {
-						t.logger.DebugContext(ctx, "round-robin success from ", res.tag)
-						finish(res.response, nil)
-						return
-					}
-					// This order failed; keep scanning for the next success.
-				}
-
-			case <-ctx.Done():
-				finish(nil, ctx.Err())
-				return
-			}
-		}
-
-		// All servers responded and all failed.
-		if firstErr != nil {
-			finish(nil, firstErr)
-		} else {
-			finish(nil, E.New("all DNS servers failed"))
-		}
-	}()
+	// All servers failed.
+	if lastErr != nil {
+		callback(nil, lastErr)
+	} else {
+		callback(nil, E.New("all DNS servers failed"))
+	}
 }
