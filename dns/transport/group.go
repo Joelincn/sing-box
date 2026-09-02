@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -12,6 +13,11 @@ import (
 	"github.com/sagernet/sing/service"
 
 	mDNS "github.com/miekg/dns"
+)
+
+const (
+	StrategyConcurrent = "concurrent"
+	StrategyRoundRobin = "round_robin"
 )
 
 var _ adapter.DNSTransport = (*GroupTransport)(nil)
@@ -25,17 +31,29 @@ type GroupTransport struct {
 
 	ctx        context.Context
 	logger     log.ContextLogger
+	strategy   string
 	serverTags []string
+	rrIndex    atomic.Uint32 // Round-robin index
 }
 
 func NewGroup(ctx context.Context, logger log.ContextLogger, tag string, options option.GroupDNSServerOptions) (adapter.DNSTransport, error) {
 	if len(options.Servers) == 0 {
 		return nil, E.New("missing servers")
 	}
+	
+	strategy := options.Strategy
+	if strategy == "" {
+		strategy = StrategyConcurrent
+	}
+	if strategy != StrategyConcurrent && strategy != StrategyRoundRobin {
+		return nil, E.New("invalid strategy: ", strategy, ", must be 'concurrent' or 'round_robin'")
+	}
+	
 	return &GroupTransport{
 		TransportAdapter: dns.NewTransportAdapter(C.DNSTypeGroup, tag, options.Servers),
 		ctx:              ctx,
 		logger:           logger,
+		strategy:         strategy,
 		serverTags:       options.Servers,
 	}, nil
 }
@@ -92,6 +110,15 @@ func (t *GroupTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, c
 		return
 	}
 
+	if t.strategy == StrategyRoundRobin {
+		t.exchangeRoundRobin(ctx, transportManager, message, callback)
+	} else {
+		t.exchangeConcurrent(ctx, transportManager, message, callback)
+	}
+}
+
+// exchangeConcurrent 并发查询所有服务器，返回最快的响应（原有逻辑）
+func (t *GroupTransport) exchangeConcurrent(ctx context.Context, transportManager adapter.DNSTransportManager, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
 	type result struct {
 		response *mDNS.Msg
 		tag      string
@@ -134,4 +161,57 @@ func (t *GroupTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, c
 			callback(nil, E.New("all DNS servers failed"))
 		}
 	}()
+}
+
+// exchangeRoundRobin 轮询查询，每次选择下一个服务器，失败时自动尝试下一个
+func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManager adapter.DNSTransportManager, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	serverCount := uint32(len(t.serverTags))
+	var lastErr error
+	
+	// 尝试所有服务器，从当前轮询索引开始
+	for i := uint32(0); i < serverCount; i++ {
+		// 获取当前轮询索引对应的服务器
+		index := (t.rrIndex.Load() + i) % serverCount
+		tag := t.serverTags[index]
+		
+		transport, loaded := transportManager.Transport(tag)
+		if !loaded {
+			lastErr = E.New("DNS server not found: ", tag)
+			t.logger.DebugContext(ctx, "round-robin skip (not found): ", tag)
+			continue
+		}
+		
+		// 尝试查询当前服务器
+		var response *mDNS.Msg
+		var err error
+		done := make(chan struct{})
+		
+		transport.ExchangeAsync(ctx, message.Copy(), func(resp *mDNS.Msg, e error) {
+			response = resp
+			err = e
+			close(done)
+		})
+		
+		// 等待查询完成
+		<-done
+		
+		if err == nil && response != nil {
+			// 成功，更新轮询索引到下一个
+			t.rrIndex.Store((index + 1) % serverCount)
+			t.logger.DebugContext(ctx, "round-robin success from ", tag)
+			callback(response, nil)
+			return
+		}
+		
+		// 失败，记录错误并继续尝试下一个
+		lastErr = err
+		t.logger.DebugContext(ctx, "round-robin failed: ", tag, ", error: ", err)
+	}
+	
+	// 所有服务器都失败
+	if lastErr != nil {
+		callback(nil, lastErr)
+	} else {
+		callback(nil, E.New("all DNS servers failed"))
+	}
 }
