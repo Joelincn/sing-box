@@ -168,10 +168,21 @@ func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManage
 	serverCount := uint32(len(t.serverTags))
 	var lastErr error
 	
+	// 原子性地获取并递增轮询索引，避免并发竞态
+	startIndex := atomic.AddUint32(&t.rrIndex, 1) - 1
+	
 	// 尝试所有服务器，从当前轮询索引开始
 	for i := uint32(0); i < serverCount; i++ {
+		// 检查 context 是否已被取消
+		select {
+		case <-ctx.Done():
+			callback(nil, ctx.Err())
+			return
+		default:
+		}
+		
 		// 获取当前轮询索引对应的服务器
-		index := (t.rrIndex.Load() + i) % serverCount
+		index := (startIndex + i) % serverCount
 		tag := t.serverTags[index]
 		
 		transport, loaded := transportManager.Transport(tag)
@@ -192,12 +203,18 @@ func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManage
 			close(done)
 		})
 		
-		// 等待查询完成
-		<-done
+		// 等待查询完成或 context 取消
+		select {
+		case <-done:
+			// 查询完成，继续处理
+		case <-ctx.Done():
+			// Context 被取消，立即返回
+			callback(nil, ctx.Err())
+			return
+		}
 		
 		if err == nil && response != nil {
-			// 成功，更新轮询索引到下一个
-			t.rrIndex.Store((index + 1) % serverCount)
+			// 成功
 			t.logger.DebugContext(ctx, "round-robin success from ", tag)
 			callback(response, nil)
 			return
