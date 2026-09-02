@@ -169,7 +169,7 @@ func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManage
 	var lastErr error
 	
 	// 原子性地获取并递增轮询索引，避免并发竞态
-	startIndex := atomic.AddUint32(&t.rrIndex, 1) - 1
+	startIndex := t.rrIndex.Add(1) - 1
 	
 	// 尝试所有服务器，从当前轮询索引开始
 	for i := uint32(0); i < serverCount; i++ {
