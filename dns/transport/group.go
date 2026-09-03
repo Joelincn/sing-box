@@ -174,10 +174,22 @@ func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManage
 	serverCount := len(t.serverTags)
 	startIndex := int(t.rrIndex.Add(1)-1) % serverCount
 
+	// Use global timeout for the entire round-robin process, not per-server
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	var lastErr error
 
 	// Try each server in round-robin order, stopping at the first success.
 	for i := 0; i < serverCount; i++ {
+		// Check if we've exceeded the global timeout
+		select {
+		case <-ctx.Done():
+			callback(nil, ctx.Err())
+			return
+		default:
+		}
+
 		index := (startIndex + i) % serverCount
 		tag := t.serverTags[index]
 		transport, loaded := transportManager.Transport(tag)
@@ -186,20 +198,30 @@ func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManage
 			continue
 		}
 
-		// Query only this server (not all servers concurrently).
-		// Use a per-server timeout to avoid blocking too long on a slow server.
-		serverCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		response, err := transport.Exchange(serverCtx, message.Copy())
-		cancel()
+		// Use async query to avoid blocking
+		done := make(chan struct{})
+		var response *mDNS.Msg
+		var err error
 
-		if err == nil && response != nil {
-			t.logger.DebugContext(ctx, "round-robin success from ", tag)
-			callback(response, nil)
+		transport.ExchangeAsync(ctx, message.Copy(), func(resp *mDNS.Msg, e error) {
+			response = resp
+			err = e
+			close(done)
+		})
+
+		select {
+		case <-done:
+			if err == nil && response != nil {
+				t.logger.DebugContext(ctx, "round-robin success from ", tag)
+				callback(response, nil)
+				return
+			}
+			lastErr = err
+			t.logger.DebugContext(ctx, "round-robin failed from ", tag, ": ", err, ", trying next")
+		case <-ctx.Done():
+			callback(nil, ctx.Err())
 			return
 		}
-
-		lastErr = err
-		t.logger.DebugContext(ctx, "round-robin failed from ", tag, ": ", err, ", trying next")
 	}
 
 	// All servers failed.
