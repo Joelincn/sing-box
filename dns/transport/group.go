@@ -3,7 +3,6 @@ package transport
 import (
 	"context"
 	"sync/atomic"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -165,69 +164,28 @@ func (t *GroupTransport) exchangeConcurrent(ctx context.Context, transportManage
 	}()
 }
 
-// exchangeRoundRobin implements true round-robin load balancing: each request
-// queries only the preferred server (selected by round-robin index), and only
-// falls back to the next server if the preferred one fails. This ensures that
-// N concurrent requests are distributed across N servers for even load
-// distribution, minimizing resource usage when servers have query limits.
+// exchangeRoundRobin implements true round-robin load balancing (like mosdns-x):
+// each request queries only the preferred server (selected by round-robin index).
+// No fallback - if the preferred server fails, the error is returned immediately.
+// This ensures that N concurrent requests are distributed across N servers
+// for even load distribution, minimizing resource usage when servers have
+// query limits.
 func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManager adapter.DNSTransportManager, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
 	serverCount := len(t.serverTags)
-	startIndex := int(t.rrIndex.Add(1)-1) % serverCount
+	index := int(t.rrIndex.Add(1)-1) % serverCount
+	tag := t.serverTags[index]
 
-	// Use global timeout for the entire round-robin process, not per-server
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	var lastErr error
-
-	// Try each server in round-robin order, stopping at the first success.
-	for i := 0; i < serverCount; i++ {
-		// Check if we've exceeded the global timeout
-		select {
-		case <-ctx.Done():
-			callback(nil, ctx.Err())
-			return
-		default:
-		}
-
-		index := (startIndex + i) % serverCount
-		tag := t.serverTags[index]
-		transport, loaded := transportManager.Transport(tag)
-		if !loaded {
-			t.logger.DebugContext(ctx, "round-robin: server not found: ", tag)
-			continue
-		}
-
-		// Use async query to avoid blocking
-		done := make(chan struct{})
-		var response *mDNS.Msg
-		var err error
-
-		transport.ExchangeAsync(ctx, message.Copy(), func(resp *mDNS.Msg, e error) {
-			response = resp
-			err = e
-			close(done)
-		})
-
-		select {
-		case <-done:
-			if err == nil && response != nil {
-				t.logger.DebugContext(ctx, "round-robin success from ", tag)
-				callback(response, nil)
-				return
-			}
-			lastErr = err
-			t.logger.DebugContext(ctx, "round-robin failed from ", tag, ": ", err, ", trying next")
-		case <-ctx.Done():
-			callback(nil, ctx.Err())
-			return
-		}
+	transport, loaded := transportManager.Transport(tag)
+	if !loaded {
+		callback(nil, E.New("round-robin: server not found: ", tag))
+		return
 	}
 
-	// All servers failed.
-	if lastErr != nil {
-		callback(nil, lastErr)
-	} else {
-		callback(nil, E.New("all DNS servers failed"))
-	}
+	// Query only the preferred server, no fallback
+	transport.ExchangeAsync(ctx, message.Copy(), func(response *mDNS.Msg, err error) {
+		if err == nil && response != nil {
+			t.logger.DebugContext(ctx, "round-robin success from ", tag)
+		}
+		callback(response, err)
+	})
 }
