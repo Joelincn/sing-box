@@ -2,7 +2,9 @@ package transport
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -18,6 +20,8 @@ import (
 const (
 	StrategyConcurrent = "concurrent"
 	StrategyRoundRobin = "round_robin"
+
+	excludeWindow = 15 * time.Minute
 )
 
 var _ adapter.DNSTransport = (*GroupTransport)(nil)
@@ -34,6 +38,12 @@ type GroupTransport struct {
 	strategy   string
 	serverTags []string
 	rrIndex    atomic.Uint32
+
+	excludeThreshold int
+	mu               sync.Mutex
+	failures         []int
+	excluded         []bool
+	windowStart      time.Time
 }
 
 func NewGroup(ctx context.Context, logger log.ContextLogger, tag string, options option.GroupDNSServerOptions) (adapter.DNSTransport, error) {
@@ -48,6 +58,9 @@ func NewGroup(ctx context.Context, logger log.ContextLogger, tag string, options
 	if strategy != StrategyConcurrent && strategy != StrategyRoundRobin {
 		return nil, E.New("invalid strategy: ", strategy, ", must be 'concurrent' or 'round_robin'")
 	}
+	if options.ExcludeThreshold < 0 {
+		return nil, E.New("invalid exclude_threshold: must be >= 0")
+	}
 
 	return &GroupTransport{
 		TransportAdapter: dns.NewTransportAdapter(C.DNSTypeGroup, tag, options.Servers),
@@ -55,6 +68,10 @@ func NewGroup(ctx context.Context, logger log.ContextLogger, tag string, options
 		logger:           logger,
 		strategy:         strategy,
 		serverTags:       options.Servers,
+		excludeThreshold: options.ExcludeThreshold,
+		failures:         make([]int, len(options.Servers)),
+		excluded:         make([]bool, len(options.Servers)),
+		windowStart:      time.Now(),
 	}, nil
 }
 
@@ -86,6 +103,72 @@ func (t *GroupTransport) Close() error {
 }
 
 func (t *GroupTransport) Reset() {
+	if t.excludeThreshold <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := range t.serverTags {
+		t.failures[i] = 0
+		t.excluded[i] = false
+	}
+	t.windowStart = time.Now()
+}
+
+func (t *GroupTransport) healthEnabled() bool {
+	return t.excludeThreshold > 0
+}
+
+func (t *GroupTransport) rotateWindowLocked(now time.Time) {
+	if now.Sub(t.windowStart) >= excludeWindow {
+		for i := range t.serverTags {
+			t.failures[i] = 0
+			t.excluded[i] = false
+		}
+		t.windowStart = now
+	}
+}
+
+func (t *GroupTransport) activeTags() []string {
+	if !t.healthEnabled() {
+		return t.serverTags
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.rotateWindowLocked(time.Now())
+	active := make([]string, 0, len(t.serverTags))
+	for i, tag := range t.serverTags {
+		if !t.excluded[i] {
+			active = append(active, tag)
+		}
+	}
+	if len(active) == 0 {
+		return t.serverTags
+	}
+	return active
+}
+
+func (t *GroupTransport) recordResult(tag string, err error, response *mDNS.Msg) {
+	if !t.healthEnabled() {
+		return
+	}
+	if err == nil && response != nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.rotateWindowLocked(time.Now())
+	for i, candidate := range t.serverTags {
+		if candidate != tag {
+			continue
+		}
+		t.failures[i]++
+		if !t.excluded[i] && t.failures[i] >= t.excludeThreshold {
+			t.excluded[i] = true
+			t.logger.WarnContext(t.ctx, "group exclude DNS server ", tag, ": ", t.failures[i], " failures in 15m")
+		}
+		return
+	}
 }
 
 func (t *GroupTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
@@ -129,7 +212,8 @@ func (t *GroupTransport) exchangeConcurrent(ctx context.Context, transportManage
 	resultCh := make(chan result, len(t.serverTags))
 	ctx, cancel := context.WithCancel(ctx)
 
-	for _, tag := range t.serverTags {
+	tags := t.activeTags()
+	for _, tag := range tags {
 		transport, loaded := transportManager.Transport(tag)
 		if !loaded {
 			resultCh <- result{nil, tag, E.New("DNS server not found: ", tag)}
@@ -142,8 +226,9 @@ func (t *GroupTransport) exchangeConcurrent(ctx context.Context, transportManage
 
 	go func() {
 		var firstErr error
-		for range t.serverTags {
+		for range tags {
 			r := <-resultCh
+			t.recordResult(r.tag, r.err, r.response)
 			if r.err == nil && r.response != nil {
 				t.logger.DebugContext(ctx, "fastest response from ", r.tag)
 				cancel()
@@ -171,9 +256,9 @@ func (t *GroupTransport) exchangeConcurrent(ctx context.Context, transportManage
 // for even load distribution, minimizing resource usage when servers have
 // query limits.
 func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManager adapter.DNSTransportManager, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
-	serverCount := len(t.serverTags)
-	index := int(t.rrIndex.Add(1)-1) % serverCount
-	tag := t.serverTags[index]
+	tags := t.activeTags()
+	index := int(t.rrIndex.Add(1)-1) % len(tags)
+	tag := tags[index]
 
 	transport, loaded := transportManager.Transport(tag)
 	if !loaded {
@@ -183,6 +268,7 @@ func (t *GroupTransport) exchangeRoundRobin(ctx context.Context, transportManage
 
 	// Query only the preferred server, no fallback
 	transport.ExchangeAsync(ctx, message.Copy(), func(response *mDNS.Msg, err error) {
+		t.recordResult(tag, err, response)
 		if err == nil && response != nil {
 			t.logger.DebugContext(ctx, "round-robin success from ", tag)
 		}
