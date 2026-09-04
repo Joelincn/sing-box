@@ -21,7 +21,8 @@
   "interval": "",
   "idle_timeout": "",
   "ttl": "10m",
-  "use_all_providers": false
+  "use_all_providers": false,
+  "exclude_threshold": 0
 }
 ```
 
@@ -79,3 +80,7 @@
 #### use_all_providers
 
 是否使用所有提供者。默认使用 `false`。
+
+#### exclude_threshold
+
+单个出站在15分钟窗口内允许的最大拨号失败次数，超过后将暂时从负载均衡中剔除，适用于所有策略（`round-robin`、`consistent-hashing`、`sticky-sessions`）。只统计真实业务拨号失败，调用方主动取消的不计；URL 测试失败只影响可用性判定，不计入。下一个15分钟窗口开始时重新纳入。默认为 `0`（不启用）。
