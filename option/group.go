@@ -33,9 +33,10 @@ type URLTestFallbackOptions struct {
 
 type LoadBalanceOutboundOptions struct {
 	GroupCommonOption
-	URL         string             `json:"url,omitempty"`
-	Interval    badoption.Duration `json:"interval,omitempty"`
-	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
-	TTL         badoption.Duration `json:"ttl,omitempty"`
-	Strategy    string             `json:"strategy,omitempty"`
+	URL              string             `json:"url,omitempty"`
+	Interval         badoption.Duration `json:"interval,omitempty"`
+	IdleTimeout      badoption.Duration `json:"idle_timeout,omitempty"`
+	TTL              badoption.Duration `json:"ttl,omitempty"`
+	Strategy         string             `json:"strategy,omitempty"`
+	ExcludeThreshold int                `json:"exclude_threshold,omitempty"`
 }
