@@ -66,6 +66,7 @@ type LoadBalance struct {
 	strategy            string
 	excludeThreshold    int
 	interruptExistConns bool
+	interruptExclude    []option.InterruptExcludeOptions
 	providerAccess      sync.Mutex
 	providerUpdateCheck providerUpdateCheckScheduler
 
@@ -108,6 +109,7 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 
 		excludeThreshold:    options.ExcludeThreshold,
 		interruptExistConns: options.InterruptExistConnections,
+		interruptExclude:    options.InterruptExclude,
 
 		provider:       service.FromContext[adapter.ProviderManager](ctx),
 		providers:      make(map[string]adapter.Provider),
@@ -117,6 +119,9 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
 		useAllProviders: options.UseAllProviders,
+	}
+	if len(options.InterruptExclude) > 0 && (options.ExcludeThreshold <= 0 || !options.InterruptExistConnections) {
+		logger.WarnContext(ctx, "interrupt_exclude is set but interrupt_exist_connections is disabled, ignored")
 	}
 	return outbound, nil
 }
@@ -157,7 +162,7 @@ func (s *LoadBalance) Start() error {
 		s.tags = append(s.tags, detour.Tag())
 		outbounds = append(outbounds, detour)
 	}
-	group, err := NewLoadBalanceGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.idleTimeout, s.ttl, s.strategy, s.excludeThreshold, s.interruptExistConns)
+	group, err := NewLoadBalanceGroup(s.ctx, s.router, s.outbound, s.logger, outbounds, s.link, s.interval, s.idleTimeout, s.ttl, s.strategy, s.excludeThreshold, s.interruptExistConns, s.interruptExclude)
 	if err != nil {
 		return err
 	}
@@ -244,7 +249,10 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 	if err == nil {
 		wrapped := s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx))
 		if tag := RealTag(outbound); s.group.trackingEnabled() {
-			tracked := &trackedConn{Conn: wrapped, group: s.group, tag: tag}
+			tracked := &trackedConn{Conn: wrapped, group: s.group, tag: tag, protected: s.group.interruptExcluder.isProtected(metadata)}
+			if tracked.protected {
+				s.group.logger.Debug("load-balance interrupt exclude protected connection to ", destination, " on ", tag)
+			}
 			s.group.trackConn(tag, tracked)
 			return tracked, nil
 		} else {
@@ -271,7 +279,10 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	if err == nil {
 		wrapped := s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx))
 		if tag := RealTag(outbound); s.group.trackingEnabled() {
-			tracked := &trackedPacketConn{PacketConn: wrapped, group: s.group, tag: tag}
+			tracked := &trackedPacketConn{PacketConn: wrapped, group: s.group, tag: tag, protected: s.group.interruptExcluder.isProtected(metadata)}
+			if tracked.protected {
+				s.group.logger.Debug("load-balance interrupt exclude protected packet connection to ", destination, " on ", tag)
+			}
 			s.group.trackConn(tag, tracked)
 			return tracked, nil
 		} else {
@@ -362,11 +373,12 @@ type LoadBalanceGroup struct {
 	windowStart      time.Time
 
 	interruptExistConns bool
+	interruptExcluder   *interruptExcluder
 	connAccess          sync.Mutex
 	trackedConns        map[string]map[io.Closer]struct{}
 }
 
-func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, strategy string, excludeThreshold int, interruptExistConns bool) (*LoadBalanceGroup, error) {
+func NewLoadBalanceGroup(ctx context.Context, router adapter.Router, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, strategy string, excludeThreshold int, interruptExistConns bool, interruptExclude []option.InterruptExcludeOptions) (*LoadBalanceGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -406,6 +418,13 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 
 		interruptExistConns: interruptExistConns,
 		trackedConns:        make(map[string]map[io.Closer]struct{}),
+	}
+	if excludeThreshold > 0 && interruptExistConns && len(interruptExclude) > 0 {
+		excluder, err := newInterruptExcluder(router, interruptExclude)
+		if err != nil {
+			return nil, err
+		}
+		loadBalanceGroup.interruptExcluder = excluder
 	}
 	loadBalanceGroup.storeOutbounds(outbounds)
 	switch strategy {
@@ -569,8 +588,9 @@ func (g *LoadBalanceGroup) trackingEnabled() bool {
 
 type trackedConn struct {
 	net.Conn
-	group *LoadBalanceGroup
-	tag   string
+	group     *LoadBalanceGroup
+	tag       string
+	protected bool
 }
 
 func (c *trackedConn) Close() error {
@@ -578,15 +598,28 @@ func (c *trackedConn) Close() error {
 	return c.Conn.Close()
 }
 
+func (c *trackedConn) isProtected() bool {
+	return c.protected
+}
+
 type trackedPacketConn struct {
 	net.PacketConn
-	group *LoadBalanceGroup
-	tag   string
+	group     *LoadBalanceGroup
+	tag       string
+	protected bool
 }
 
 func (c *trackedPacketConn) Close() error {
 	c.group.untrackConn(c.tag, c)
 	return c.PacketConn.Close()
+}
+
+func (c *trackedPacketConn) isProtected() bool {
+	return c.protected
+}
+
+type protectedConn interface {
+	isProtected() bool
 }
 
 func (g *LoadBalanceGroup) trackConn(tag string, conn io.Closer) {
@@ -621,11 +654,19 @@ func (g *LoadBalanceGroup) interruptMember(tag string) {
 	if !ok {
 		return
 	}
+	var skipped int
 	for conn := range set {
+		if protected, ok := conn.(protectedConn); ok && protected.isProtected() {
+			skipped++
+			continue
+		}
 		_ = conn.Close()
 	}
-	if len(set) > 0 {
-		g.logger.Warn("load-balance interrupt connections of excluded outbound ", tag, ": ", len(set), " connections")
+	if len(set) > skipped {
+		g.logger.Warn("load-balance interrupt connections of excluded outbound ", tag, ": ", len(set)-skipped, " connections")
+	}
+	if skipped > 0 {
+		g.logger.Debug("load-balance interrupt exclude protected connections of excluded outbound ", tag, ": ", skipped, " connections")
 	}
 }
 
