@@ -557,6 +557,18 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 		if checked[realTag] {
 			continue
 		}
+		if delay, reused := reuseGroupDelay(detour, g.history, g.interval); reused {
+			checked[realTag] = true
+			g.logger.Debug("outbound ", tag, " reuse: ", delay, "ms")
+			g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+				Time:  time.Now(),
+				Delay: delay,
+			})
+			resultAccess.Lock()
+			result[tag] = delay
+			resultAccess.Unlock()
+			continue
+		}
 		if !groupMemberReady(detour, g.history) {
 			g.logger.Debug("skip untested group member ", tag)
 			skipped = true
@@ -623,6 +635,45 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 		}
 	}
 	return result, nil
+}
+
+func reuseGroupDelay(detour adapter.Outbound, history *urltest.HistoryStorage, maxAge time.Duration) (uint16, bool) {
+	switch group := detour.(type) {
+	case *URLTest:
+		if group.group == nil {
+			return 0, false
+		}
+		for _, selected := range []adapter.Outbound{group.group.selectedOutboundTCP.Load(), group.group.selectedOutboundUDP.Load()} {
+			if selected == nil {
+				continue
+			}
+			if h := history.LoadURLTestHistory(RealTag(selected)); h != nil && time.Since(h.Time) <= maxAge {
+				return h.Delay, true
+			}
+		}
+		return 0, false
+	case *LoadBalance:
+		if group.group == nil {
+			return 0, false
+		}
+		var minDelay uint16
+		found := false
+		for _, member := range group.group.loadOutbounds() {
+			realTag := RealTag(member)
+			if group.group.isExcluded(realTag) {
+				continue
+			}
+			if h := history.LoadURLTestHistory(realTag); h != nil && time.Since(h.Time) <= maxAge {
+				if !found || h.Delay < minDelay {
+					minDelay = h.Delay
+					found = true
+				}
+			}
+		}
+		return minDelay, found
+	default:
+		return 0, false
+	}
 }
 
 func groupMemberReady(detour adapter.Outbound, history *urltest.HistoryStorage) bool {
