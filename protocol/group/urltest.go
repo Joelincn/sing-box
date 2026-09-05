@@ -529,6 +529,8 @@ type urlTestResult struct {
 	err   error
 }
 
+const urlTestUnreadyRetryDelay = 10 * time.Second
+
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
 	if !g.checking.TryLock() {
 		return make(map[string]uint16), nil
@@ -548,6 +550,7 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
+	skipped := false
 	for _, detour := range g.loadOutbounds() {
 		tag := detour.Tag()
 		realTag := RealTag(detour)
@@ -556,6 +559,7 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 		}
 		if !groupMemberReady(detour, g.history) {
 			g.logger.Debug("skip untested group member ", tag)
+			skipped = true
 			continue
 		}
 		history := g.history.LoadURLTestHistory(realTag)
@@ -602,6 +606,21 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 	case <-ctx.Done():
 	default:
 		g.performUpdateCheck()
+	}
+	if skipped && (g.selectedOutboundTCP.Load() == nil || g.selectedOutboundUDP.Load() == nil) {
+		select {
+		case <-g.close:
+		case <-ctx.Done():
+		default:
+			time.AfterFunc(urlTestUnreadyRetryDelay, func() {
+				select {
+				case <-g.close:
+				case <-ctx.Done():
+				default:
+					g.CheckOutbounds(g.ctx, false)
+				}
+			})
+		}
 	}
 	return result, nil
 }
