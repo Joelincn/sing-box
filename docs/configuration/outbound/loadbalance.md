@@ -22,7 +22,8 @@
   "idle_timeout": "",
   "ttl": "10m",
   "use_all_providers": false,
-  "exclude_threshold": 0
+  "exclude_threshold": 0,
+  "interrupt_exist_connections": false
 }
 ```
 
@@ -84,3 +85,7 @@ Whether to use all providers for testing. `false` will be used if empty.
 #### exclude_threshold
 
 Maximum number of dial failures per outbound within a 15-minute window before it is temporarily excluded from load balancing. Applies to all strategies (`round-robin`, `consistent-hashing`, `sticky-sessions`). Only real traffic dial failures are counted, except cancellations caused by the caller. URL test failures only affect availability and are not counted. Excluded outbounds are re-included when the next 15-minute window starts. Defaults to `0` (disabled).
+
+#### interrupt_exist_connections
+
+When a member is excluded by `exclude_threshold`, whether to also close its existing connections. `false` will be used if empty (only skip it in selection).
