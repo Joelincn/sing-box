@@ -607,7 +607,7 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 	default:
 		g.performUpdateCheck()
 	}
-	if skipped && (g.selectedOutboundTCP.Load() == nil || g.selectedOutboundUDP.Load() == nil) {
+	if skipped && len(result) == 0 {
 		select {
 		case <-g.close:
 		case <-ctx.Done():
