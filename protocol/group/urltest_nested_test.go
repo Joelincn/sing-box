@@ -89,3 +89,11 @@ func TestReuseGroupDelayLeaf(t *testing.T) {
 	require.False(t, ok)
 	require.True(t, groupMemberReady(adapter.Outbound(leaf), history))
 }
+
+func TestNeedsUnreadyRetry(t *testing.T) {
+	history := urltest.NewHistoryStorage()
+	require.False(t, needsUnreadyRetry(nil, history))
+	storeDelay(history, "measured", 10)
+	require.False(t, needsUnreadyRetry([]string{"measured"}, history))
+	require.True(t, needsUnreadyRetry([]string{"measured", "never-probed"}, history))
+}

@@ -338,6 +338,7 @@ type URLTestGroup struct {
 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
+	unreadyRetryCount            int
 	access                       sync.Mutex
 	updateAccess                 sync.Mutex
 	ticker                       *time.Ticker
@@ -531,6 +532,8 @@ type urlTestResult struct {
 
 const urlTestUnreadyRetryDelay = 10 * time.Second
 
+const maxUnreadyRetries = 30
+
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
 	if !g.checking.TryLock() {
 		return make(map[string]uint16), nil
@@ -550,7 +553,7 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
-	skipped := false
+	var skippedRealTags []string
 	for _, detour := range g.loadOutbounds() {
 		tag := detour.Tag()
 		realTag := RealTag(detour)
@@ -571,7 +574,7 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 		}
 		if !groupMemberReady(detour, g.history) {
 			g.logger.Debug("skip untested group member ", tag)
-			skipped = true
+			skippedRealTags = append(skippedRealTags, realTag)
 			continue
 		}
 		history := g.history.LoadURLTestHistory(realTag)
@@ -619,22 +622,36 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 	default:
 		g.performUpdateCheck()
 	}
-	if skipped && len(result) == 0 {
-		select {
-		case <-g.close:
-		case <-ctx.Done():
-		default:
-			time.AfterFunc(urlTestUnreadyRetryDelay, func() {
-				select {
-				case <-g.close:
-				case <-ctx.Done():
-				default:
-					g.CheckOutbounds(g.ctx, false)
-				}
-			})
+	if needsUnreadyRetry(skippedRealTags, g.history) {
+		if g.unreadyRetryCount < maxUnreadyRetries {
+			g.unreadyRetryCount++
+			select {
+			case <-g.close:
+			case <-ctx.Done():
+			default:
+				time.AfterFunc(urlTestUnreadyRetryDelay, func() {
+					select {
+					case <-g.close:
+					case <-ctx.Done():
+					default:
+						g.CheckOutbounds(g.ctx, false)
+					}
+				})
+			}
 		}
+	} else {
+		g.unreadyRetryCount = 0
 	}
 	return result, nil
+}
+
+func needsUnreadyRetry(skippedRealTags []string, history *urltest.HistoryStorage) bool {
+	for _, realTag := range skippedRealTags {
+		if history.LoadURLTestHistory(realTag) == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func reuseGroupDelay(detour adapter.Outbound, history *urltest.HistoryStorage, maxAge time.Duration) (uint16, bool) {
