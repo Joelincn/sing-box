@@ -470,6 +470,9 @@ func (g *LoadBalanceGroup) Close() error {
 	g.ticker.Stop()
 	g.pause.UnregisterCallback(g.pauseCallback)
 	close(g.close)
+	if g.interruptExcluder != nil {
+		_ = g.interruptExcluder.Close()
+	}
 	return nil
 }
 

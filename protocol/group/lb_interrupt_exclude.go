@@ -8,7 +8,8 @@ import (
 )
 
 type interruptExcluder struct {
-	entries [][]rule.RuleItem
+	entries      [][]rule.RuleItem
+	ruleSetItems []*rule.RuleSetItem
 }
 
 func newInterruptExcluder(router adapter.Router, options []option.InterruptExcludeOptions) (*interruptExcluder, error) {
@@ -18,6 +19,7 @@ func newInterruptExcluder(router adapter.Router, options []option.InterruptExclu
 		if len(entryOptions.DomainSuffix) > 0 {
 			item, err := rule.NewDomainItem(nil, entryOptions.DomainSuffix, router.DefaultDomainMatchStrategy())
 			if err != nil {
+				excluder.Close()
 				return nil, E.Cause(err, "interrupt_exclude[", i, "]")
 			}
 			items = append(items, item)
@@ -35,14 +37,29 @@ func newInterruptExcluder(router adapter.Router, options []option.InterruptExclu
 			items = append(items, rule.NewPortItem(false, entryOptions.Port))
 		}
 		if len(entryOptions.RuleSet) > 0 {
-			items = append(items, rule.NewRuleSetItem(router, entryOptions.RuleSet, false, false))
+			item := rule.NewRuleSetItem(router, entryOptions.RuleSet, false, false)
+			if err := item.Start(); err != nil {
+				excluder.Close()
+				return nil, E.Cause(err, "interrupt_exclude[", i, "]")
+			}
+			items = append(items, item)
+			excluder.ruleSetItems = append(excluder.ruleSetItems, item)
 		}
 		if len(items) == 0 {
+			excluder.Close()
 			return nil, E.New("interrupt_exclude[", i, "]: empty item is not allowed")
 		}
 		excluder.entries = append(excluder.entries, items)
 	}
 	return excluder, nil
+}
+
+func (e *interruptExcluder) Close() error {
+	for _, item := range e.ruleSetItems {
+		_ = item.Close()
+	}
+	e.ruleSetItems = nil
+	return nil
 }
 
 func (e *interruptExcluder) isProtected(metadata *adapter.InboundContext) bool {
