@@ -111,4 +111,4 @@ Each entry may contain `domain_suffix`, `package_name`, `process_name`, `process
 }
 ```
 
-Notes: an empty entry is rejected at startup; protection only skips closing, the excluded outbound still takes no new connections. Domain conditions require the domain to be visible (via DNS, Fake-IP reverse mapping or sniffing); connections without a visible domain never match domain conditions. `package_name` only matches on Android, `process_name`/`process_path` only on desktop.
+Notes: an empty entry is rejected at startup (a lone `[{}]` is silently dropped by the config parser before validation, which is upstream behavior shared by all list options — always write at least one condition per entry); protection only skips closing, the excluded outbound still takes no new connections. Domain conditions require the domain to be visible (via DNS, Fake-IP reverse mapping or sniffing); connections without a visible domain never match domain conditions. `package_name` only matches on Android, `process_name`/`process_path` only on desktop.

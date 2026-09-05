@@ -66,7 +66,7 @@ type LoadBalance struct {
 	strategy            string
 	excludeThreshold    int
 	interruptExistConns bool
-	interruptExclude    []option.InterruptExcludeOptions
+	interruptExcluder   *interruptExcluder
 	providerAccess      sync.Mutex
 	providerUpdateCheck providerUpdateCheckScheduler
 
@@ -109,7 +109,6 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 
 		excludeThreshold:    options.ExcludeThreshold,
 		interruptExistConns: options.InterruptExistConnections,
-		interruptExclude:    options.InterruptExclude,
 
 		provider:       service.FromContext[adapter.ProviderManager](ctx),
 		providers:      make(map[string]adapter.Provider),
@@ -122,6 +121,13 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 	}
 	if len(options.InterruptExclude) > 0 && (options.ExcludeThreshold <= 0 || !options.InterruptExistConnections) {
 		logger.WarnContext(ctx, "interrupt_exclude is set but interrupt_exist_connections is disabled, ignored")
+	}
+	if options.ExcludeThreshold > 0 && options.InterruptExistConnections && len(options.InterruptExclude) > 0 {
+		excluder, err := newInterruptExcluder(router, options.InterruptExclude)
+		if err != nil {
+			return nil, err
+		}
+		outbound.interruptExcluder = excluder
 	}
 	return outbound, nil
 }
@@ -162,7 +168,7 @@ func (s *LoadBalance) Start() error {
 		s.tags = append(s.tags, detour.Tag())
 		outbounds = append(outbounds, detour)
 	}
-	group, err := NewLoadBalanceGroup(s.ctx, s.router, s.outbound, s.logger, outbounds, s.link, s.interval, s.idleTimeout, s.ttl, s.strategy, s.excludeThreshold, s.interruptExistConns, s.interruptExclude)
+	group, err := NewLoadBalanceGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.idleTimeout, s.ttl, s.strategy, s.excludeThreshold, s.interruptExistConns, s.interruptExcluder)
 	if err != nil {
 		return err
 	}
@@ -378,7 +384,7 @@ type LoadBalanceGroup struct {
 	trackedConns        map[string]map[io.Closer]struct{}
 }
 
-func NewLoadBalanceGroup(ctx context.Context, router adapter.Router, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, strategy string, excludeThreshold int, interruptExistConns bool, interruptExclude []option.InterruptExcludeOptions) (*LoadBalanceGroup, error) {
+func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, strategy string, excludeThreshold int, interruptExistConns bool, interruptExcluder *interruptExcluder) (*LoadBalanceGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -417,14 +423,8 @@ func NewLoadBalanceGroup(ctx context.Context, router adapter.Router, outboundMan
 		windowStart:      time.Now(),
 
 		interruptExistConns: interruptExistConns,
+		interruptExcluder:   interruptExcluder,
 		trackedConns:        make(map[string]map[io.Closer]struct{}),
-	}
-	if excludeThreshold > 0 && interruptExistConns && len(interruptExclude) > 0 {
-		excluder, err := newInterruptExcluder(router, interruptExclude)
-		if err != nil {
-			return nil, err
-		}
-		loadBalanceGroup.interruptExcluder = excluder
 	}
 	loadBalanceGroup.storeOutbounds(outbounds)
 	switch strategy {
