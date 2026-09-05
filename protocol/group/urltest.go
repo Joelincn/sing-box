@@ -554,6 +554,10 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 		if checked[realTag] {
 			continue
 		}
+		if !groupMemberReady(detour, g.history) {
+			g.logger.Debug("skip untested group member ", tag)
+			continue
+		}
 		history := g.history.LoadURLTestHistory(realTag)
 		if !force && history != nil && time.Since(history.Time) < g.interval {
 			continue
@@ -600,6 +604,38 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 		g.performUpdateCheck()
 	}
 	return result, nil
+}
+
+func groupMemberReady(detour adapter.Outbound, history *urltest.HistoryStorage) bool {
+	switch group := detour.(type) {
+	case *URLTest:
+		if group.group == nil {
+			return true
+		}
+		if selected := group.group.selectedOutboundTCP.Load(); selected != nil {
+			if history.LoadURLTestHistory(RealTag(selected)) != nil {
+				return true
+			}
+		}
+		if selected := group.group.selectedOutboundUDP.Load(); selected != nil {
+			if history.LoadURLTestHistory(RealTag(selected)) != nil {
+				return true
+			}
+		}
+		return false
+	case *LoadBalance:
+		if group.group == nil {
+			return true
+		}
+		for _, member := range group.group.loadOutbounds() {
+			if history.LoadURLTestHistory(RealTag(member)) != nil {
+				return true
+			}
+		}
+		return false
+	default:
+		return true
+	}
 }
 
 func (g *URLTestGroup) performUpdateCheck() {
