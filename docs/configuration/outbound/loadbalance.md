@@ -22,7 +22,9 @@
   "idle_timeout": "",
   "ttl": "10m",
   "use_all_providers": false,
-  "exclude_threshold": 0
+  "exclude_threshold": 0,
+  "interrupt_exist_connections": false,
+  "interrupt_exclude": []
 }
 ```
 
@@ -84,3 +86,29 @@ Whether to use all providers for testing. `false` will be used if empty.
 #### exclude_threshold
 
 Maximum number of dial failures per outbound within a 15-minute window before it is temporarily excluded from load balancing. Applies to all strategies (`round-robin`, `consistent-hashing`, `sticky-sessions`). Only real traffic dial failures are counted, except cancellations caused by the caller. URL test failures only affect availability and are not counted. Excluded outbounds are re-included when the next 15-minute window starts. Defaults to `0` (disabled).
+
+#### interrupt_exist_connections
+
+When a member is excluded by `exclude_threshold`, whether to also close its existing connections. `false` will be used if empty (only skip it in selection).
+
+#### interrupt_exclude
+
+Connections matching any entry are protected from interruption when their outbound is excluded. Only takes effect when `interrupt_exist_connections` is enabled.
+
+Each entry may contain `domain_suffix`, `package_name`, `process_name`, `process_path`, `port` and `rule_set` conditions, using the same matching semantics as route rules. Conditions within one entry must all match (AND); entries are ORed: a connection is protected if any entry fully matches.
+
+```json
+{
+  "interrupt_exclude": [
+    {
+      "domain_suffix": ["bank.com"],
+      "package_name": ["com.example.bank"]
+    },
+    {
+      "port": [22]
+    }
+  ]
+}
+```
+
+Notes: an empty entry is rejected at startup (a lone `[{}]` is silently dropped by the config parser before validation, which is upstream behavior shared by all list options — always write at least one condition per entry); an unknown `rule_set` tag fails startup; protection only skips closing, the excluded outbound still takes no new connections. Domain conditions require the domain to be visible (via DNS, Fake-IP reverse mapping or sniffing); connections without a visible domain never match domain conditions. `package_name` only matches on Android, `process_name`/`process_path` only on desktop.

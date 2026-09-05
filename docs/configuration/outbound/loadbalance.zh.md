@@ -22,7 +22,9 @@
   "idle_timeout": "",
   "ttl": "10m",
   "use_all_providers": false,
-  "exclude_threshold": 0
+  "exclude_threshold": 0,
+  "interrupt_exist_connections": false,
+  "interrupt_exclude": []
 }
 ```
 
@@ -84,3 +86,29 @@
 #### exclude_threshold
 
 单个出站在15分钟窗口内允许的最大拨号失败次数，超过后将暂时从负载均衡中剔除，适用于所有策略（`round-robin`、`consistent-hashing`、`sticky-sessions`）。只统计真实业务拨号失败，调用方主动取消的不计；URL 测试失败只影响可用性判定，不计入。下一个15分钟窗口开始时重新纳入。默认为 `0`（不启用）。
+
+#### interrupt_exist_connections
+
+当成员被 `exclude_threshold` 剔除时，是否同时掐断它的已有连接。默认为 `false`（仅在选择时跳过）。
+
+#### interrupt_exclude
+
+命中任一条目的连接，在其出站被剔除时免于掐断。仅在 `interrupt_exist_connections` 开启时生效。
+
+每个条目可含 `domain_suffix`、`package_name`、`process_name`、`process_path`、`port`、`rule_set` 条件，匹配语义与路由规则一致：条目内多条件需全部满足（AND），条目间任一满足即豁免（OR）。
+
+```json
+{
+  "interrupt_exclude": [
+    {
+      "domain_suffix": ["bank.com"],
+      "package_name": ["com.example.bank"]
+    },
+    {
+      "port": [22]
+    }
+  ]
+}
+```
+
+注意：空条目启动时直接报错（单个 `[{}]` 会在校验前被配置解析器静默丢弃，这是上游对所有列表配置的通用行为——每个条目务必写至少一个条件）；`rule_set` 写错 tag 名同样启动报错；豁免只保"不断开"，被剔节点照样不接新连接。域名条件要求域名可见（经 DNS、Fake-IP 反查或嗅探）；无可见域名的连接永远不命中域名条件。`package_name` 仅 Android 有效，`process_name`/`process_path` 仅桌面有效。

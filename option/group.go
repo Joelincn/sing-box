@@ -33,10 +33,21 @@ type URLTestFallbackOptions struct {
 
 type LoadBalanceOutboundOptions struct {
 	GroupCommonOption
-	URL              string             `json:"url,omitempty"`
-	Interval         badoption.Duration `json:"interval,omitempty"`
-	IdleTimeout      badoption.Duration `json:"idle_timeout,omitempty"`
-	TTL              badoption.Duration `json:"ttl,omitempty"`
-	Strategy         string             `json:"strategy,omitempty"`
-	ExcludeThreshold int                `json:"exclude_threshold,omitempty"`
+	URL                       string                    `json:"url,omitempty"`
+	Interval                  badoption.Duration        `json:"interval,omitempty"`
+	IdleTimeout               badoption.Duration        `json:"idle_timeout,omitempty"`
+	TTL                       badoption.Duration        `json:"ttl,omitempty"`
+	Strategy                  string                    `json:"strategy,omitempty"`
+	ExcludeThreshold          int                       `json:"exclude_threshold,omitempty"`
+	InterruptExistConnections bool                      `json:"interrupt_exist_connections,omitempty"`
+	InterruptExclude          []InterruptExcludeOptions `json:"interrupt_exclude,omitempty"`
+}
+
+type InterruptExcludeOptions struct {
+	DomainSuffix badoption.Listable[string] `json:"domain_suffix,omitempty"`
+	PackageName  badoption.Listable[string] `json:"package_name,omitempty"`
+	ProcessName  badoption.Listable[string] `json:"process_name,omitempty"`
+	ProcessPath  badoption.Listable[string] `json:"process_path,omitempty"`
+	Port         badoption.Listable[uint16] `json:"port,omitempty"`
+	RuleSet      badoption.Listable[string] `json:"rule_set,omitempty" reference:"rule_set"`
 }
