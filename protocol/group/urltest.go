@@ -725,6 +725,15 @@ func groupMemberReady(detour adapter.Outbound, history *urltest.HistoryStorage) 
 	}
 }
 
+func isSelfMeasuringGroup(detour adapter.Outbound) bool {
+	switch detour.(type) {
+	case *URLTest, *LoadBalance:
+		return true
+	default:
+		return false
+	}
+}
+
 func (g *URLTestGroup) performUpdateCheck() {
 	g.updateAccess.Lock()
 	defer g.updateAccess.Unlock()

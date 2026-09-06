@@ -52,8 +52,8 @@ func TestReuseGroupDelayLoadBalanceChild(t *testing.T) {
 	storeDelay(history, "fast", 30)
 	storeDelay(history, "slow", 200)
 	child := &LoadBalance{group: &LoadBalanceGroup{
-		failures:   make(map[string]int),
-		excluded:   make(map[string]bool),
+		failures:    make(map[string]int),
+		excluded:    make(map[string]bool),
 		windowStart: time.Now(),
 	}}
 	child.group.storeOutbounds([]adapter.Outbound{adapter.Outbound(slow), adapter.Outbound(fast)})
