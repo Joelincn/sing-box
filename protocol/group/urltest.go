@@ -338,6 +338,7 @@ type URLTestGroup struct {
 	selectedOutboundUDP          common.TypedValue[adapter.Outbound]
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
+	unreadyRetryCount            int
 	access                       sync.Mutex
 	updateAccess                 sync.Mutex
 	ticker                       *time.Ticker
@@ -529,6 +530,10 @@ type urlTestResult struct {
 	err   error
 }
 
+const urlTestUnreadyRetryDelay = 10 * time.Second
+
+const maxUnreadyRetries = 30
+
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
 	if !g.checking.TryLock() {
 		return make(map[string]uint16), nil
@@ -548,10 +553,28 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	checked := make(map[string]bool)
 	var resultAccess sync.Mutex
+	var skippedRealTags []string
 	for _, detour := range g.loadOutbounds() {
 		tag := detour.Tag()
 		realTag := RealTag(detour)
 		if checked[realTag] {
+			continue
+		}
+		if delay, reused := reuseGroupDelay(detour, g.history, g.interval); reused {
+			checked[realTag] = true
+			g.logger.Debug("outbound ", tag, " reuse: ", delay, "ms")
+			g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+				Time:  time.Now(),
+				Delay: delay,
+			})
+			resultAccess.Lock()
+			result[tag] = delay
+			resultAccess.Unlock()
+			continue
+		}
+		if !groupMemberReady(detour, g.history) {
+			g.logger.Debug("skip untested group member ", tag)
+			skippedRealTags = append(skippedRealTags, realTag)
 			continue
 		}
 		history := g.history.LoadURLTestHistory(realTag)
@@ -599,7 +622,116 @@ func (g *URLTestGroup) urlTestLocked(ctx context.Context, force bool) (map[strin
 	default:
 		g.performUpdateCheck()
 	}
+	if needsUnreadyRetry(skippedRealTags, g.history) {
+		if g.unreadyRetryCount < maxUnreadyRetries {
+			g.unreadyRetryCount++
+			select {
+			case <-g.close:
+			case <-ctx.Done():
+			default:
+				time.AfterFunc(urlTestUnreadyRetryDelay, func() {
+					select {
+					case <-g.close:
+					case <-ctx.Done():
+					default:
+						g.CheckOutbounds(g.ctx, false)
+					}
+				})
+			}
+		}
+	} else {
+		g.unreadyRetryCount = 0
+	}
 	return result, nil
+}
+
+func needsUnreadyRetry(skippedRealTags []string, history *urltest.HistoryStorage) bool {
+	for _, realTag := range skippedRealTags {
+		if history.LoadURLTestHistory(realTag) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func reuseGroupDelay(detour adapter.Outbound, history *urltest.HistoryStorage, maxAge time.Duration) (uint16, bool) {
+	switch group := detour.(type) {
+	case *URLTest:
+		if group.group == nil {
+			return 0, false
+		}
+		for _, selected := range []adapter.Outbound{group.group.selectedOutboundTCP.Load(), group.group.selectedOutboundUDP.Load()} {
+			if selected == nil {
+				continue
+			}
+			if h := history.LoadURLTestHistory(RealTag(selected)); h != nil && time.Since(h.Time) <= maxAge {
+				return h.Delay, true
+			}
+		}
+		return 0, false
+	case *LoadBalance:
+		if group.group == nil {
+			return 0, false
+		}
+		var minDelay uint16
+		found := false
+		for _, member := range group.group.loadOutbounds() {
+			realTag := RealTag(member)
+			if group.group.isExcluded(realTag) {
+				continue
+			}
+			if h := history.LoadURLTestHistory(realTag); h != nil && time.Since(h.Time) <= maxAge {
+				if !found || h.Delay < minDelay {
+					minDelay = h.Delay
+					found = true
+				}
+			}
+		}
+		return minDelay, found
+	default:
+		return 0, false
+	}
+}
+
+func groupMemberReady(detour adapter.Outbound, history *urltest.HistoryStorage) bool {
+	switch group := detour.(type) {
+	case *URLTest:
+		if group.group == nil {
+			return true
+		}
+		if selected := group.group.selectedOutboundTCP.Load(); selected != nil {
+			if history.LoadURLTestHistory(RealTag(selected)) != nil {
+				return true
+			}
+		}
+		if selected := group.group.selectedOutboundUDP.Load(); selected != nil {
+			if history.LoadURLTestHistory(RealTag(selected)) != nil {
+				return true
+			}
+		}
+		return false
+	case *LoadBalance:
+		if group.group == nil {
+			return true
+		}
+		for _, member := range group.group.loadOutbounds() {
+			if history.LoadURLTestHistory(RealTag(member)) != nil {
+				return true
+			}
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func isSelfMeasuringGroup(detour adapter.Outbound) bool {
+	switch detour.(type) {
+	case *URLTest, *LoadBalance:
+		return true
+	default:
+		return false
+	}
 }
 
 func (g *URLTestGroup) performUpdateCheck() {

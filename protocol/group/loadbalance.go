@@ -265,7 +265,9 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 			return wrapped, nil
 		}
 	}
-	s.group.recordFailure(RealTag(outbound), err)
+	if !isSelfMeasuringGroup(outbound) {
+		s.group.recordFailure(RealTag(outbound), err)
+	}
 	s.logger.ErrorContext(ctx, err)
 	go s.group.CheckOutbounds(true)
 	return nil, err
@@ -295,7 +297,9 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 			return wrapped, nil
 		}
 	}
-	s.group.recordFailure(RealTag(outbound), err)
+	if !isSelfMeasuringGroup(outbound) {
+		s.group.recordFailure(RealTag(outbound), err)
+	}
 	s.logger.ErrorContext(ctx, err)
 	go s.group.CheckOutbounds(true)
 	return nil, err
@@ -530,6 +534,17 @@ func (g *LoadBalanceGroup) urlTestLocked(ctx context.Context, force bool) (map[s
 	for _, detour := range g.loadOutbounds() {
 		tag := detour.Tag()
 		realTag := RealTag(detour)
+		if isSelfMeasuringGroup(detour) {
+			if delay, ok := reuseGroupDelay(detour, g.history, g.interval); ok {
+				g.logger.Debug("outbound ", tag, " reuse: ", delay, "ms")
+				resultAccess.Lock()
+				result[tag] = delay
+				resultAccess.Unlock()
+			} else {
+				g.logger.Debug("skip untested group member ", tag)
+			}
+			continue
+		}
 		if checked[realTag] {
 			continue
 		}
