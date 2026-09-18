@@ -150,3 +150,12 @@ selector 成员保持现状（selector 自身不拨测，key 全靠别人补）�
   （`protocol/group/{loadbalance,urltest}.go` 各 2 行）。port 时把自有
   wrapper 的两处调用同步改名，其余 hunks 零冲突。
 - 嵌套补丁保持退役。
+
+## 七、alpha.6 基线升级
+
+- 新基线：`upstream/reF1nd-testing@9e5ea2101`（alpha.3/alpha.4 全量：provider
+  parser、多参数、SFA 连接列表、auto-redirect 完整版 + CPU 满载修复、
+  tailcat 新协议）。
+- 补丁文件内容级全同，仅中断 API 名沿用 alpha.4（`IsResourceDownload`），
+  重放零冲突；`constant/proxy.go`、`include/registry.go` 与上游 tailcat
+  钩子位不同行，mieru 钩子干净合入。
