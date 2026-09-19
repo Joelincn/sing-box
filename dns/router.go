@@ -1274,6 +1274,7 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 	if err != nil {
 		return nil, err
 	}
+	response = r.maybeChaseResponseCNAME(ctx, message, response, transport, options)
 	r.recordReverseMapping(message, response, transport)
 	return response, nil
 }
@@ -1309,6 +1310,85 @@ func (r *Router) finishExchangeAsync(message *mDNS.Msg, transport adapter.DNSTra
 	}
 	r.recordReverseMapping(message, response, transport)
 	callback(response, nil)
+}
+
+// maybeChaseResponseCNAME appends chased A/AAAA records when a client-facing
+// response carries only a bare CNAME. This covers traffic (e.g. direct
+// outbounds) that never goes through the lookup path.
+func (r *Router) maybeChaseResponseCNAME(ctx context.Context, message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport, options adapter.DNSQueryOptions) *mDNS.Msg {
+	if !r.followCNAME || response == nil || len(message.Question) == 0 {
+		return response
+	}
+	if transport != nil && transport.Type() == C.DNSTypeFakeIP {
+		return response
+	}
+	qtype := message.Question[0].Qtype
+	if qtype != mDNS.TypeA && qtype != mDNS.TypeAAAA {
+		return response
+	}
+	if chain, ok := ctx.Value(aliasChainContextKey{}).(map[string]struct{}); ok && len(chain) >= maxCNAMEFollowDepth {
+		return response
+	}
+	hasAddr := false
+	for _, ans := range response.Answer {
+		switch ans.(type) {
+		case *mDNS.A, *mDNS.AAAA:
+			hasAddr = true
+		}
+		if hasAddr {
+			break
+		}
+	}
+	if hasAddr {
+		return response
+	}
+	r.rulesAccess.RLock()
+	if r.closing {
+		r.rulesAccess.RUnlock()
+		return response
+	}
+	rules := r.rules
+	r.rulesAccess.RUnlock()
+	merged := response.Copy()
+	merged.Answer = append(merged.Answer, r.chaseResponseCNAME(ctx, rules, message.Question[0].Name, qtype, options, response)...)
+	return merged
+}
+
+func (r *Router) chaseResponseCNAME(ctx context.Context, rules []adapter.DNSRule, domain string, qType uint16, options adapter.DNSQueryOptions, response *mDNS.Msg) []mDNS.RR {
+	target := findLastCNAMETarget(mDNS.Fqdn(domain), response.Answer, qType)
+	if target == "" {
+		return nil
+	}
+	aliasCtx, loopDetected := ContextWithAliasResolution(ctx, mDNS.Fqdn(domain), target)
+	if loopDetected {
+		r.logger.DebugContext(ctx, "response cname chase loop detected: ", domain, " -> ", FqdnToDomain(target))
+		return nil
+	}
+	r.logger.DebugContext(ctx, "chase response cname: ", domain, " -> ", FqdnToDomain(target))
+	request := &mDNS.Msg{
+		MsgHdr: mDNS.MsgHdr{RecursionDesired: true},
+		Question: []mDNS.Question{{
+			Name:   target,
+			Qtype:  qType,
+			Qclass: mDNS.ClassINET,
+		}},
+	}
+	chaseResult := r.exchangeWithRules(withLookupQueryMetadata(aliasCtx, qType), rules, request, options, false)
+	if chaseResult.err != nil || chaseResult.response == nil || chaseResult.response.Rcode != mDNS.RcodeSuccess {
+		return nil
+	}
+	var records []mDNS.RR
+	for _, ans := range chaseResult.response.Answer {
+		switch ans.Header().Rrtype {
+		case qType, mDNS.TypeCNAME:
+			records = append(records, ans)
+		}
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	records = append(records, r.chaseResponseCNAME(aliasCtx, rules, FqdnToDomain(target), qType, options, chaseResult.response)...)
+	return records
 }
 
 func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQueryOptions) ([]netip.Addr, error) {
