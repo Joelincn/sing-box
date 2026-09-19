@@ -45,6 +45,7 @@ type Router struct {
 	rawRules               []option.DNSRule
 	rules                  []adapter.DNSRule
 	defaultDomainStrategy  C.DomainStrategy
+	followCNAME            bool
 	dnsReverseMapping      *freelru.Cache[netip.Addr, string]
 	platformInterface      adapter.PlatformInterface
 	legacyDNSMode          bool
@@ -66,6 +67,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		rawRules:               make([]option.DNSRule, 0, len(options.Rules)),
 		rules:                  make([]adapter.DNSRule, 0, len(options.Rules)),
 		defaultDomainStrategy:  C.DomainStrategy(options.Strategy),
+		followCNAME:            options.FollowCNAME,
 		defaultRejectRcode:     options.DefaultRejectRcode.Build(),
 		allowResolverDiscovery: options.AllowResolverDiscovery,
 		ruleByUUID:             make(map[string]adapter.DNSRule),
@@ -1081,7 +1083,35 @@ func (r *Router) lookupWithRulesType(ctx context.Context, rules []adapter.DNSRul
 	if exchangeResult.response.Rcode != mDNS.RcodeSuccess {
 		return nil, RcodeError(exchangeResult.response.Rcode)
 	}
-	return filterAddressesByQueryType(MessageToAddresses(exchangeResult.response), qType), nil
+	responseAddrs := filterAddressesByQueryType(MessageToAddresses(exchangeResult.response), qType)
+	if r.followCNAME && len(responseAddrs) == 0 && (qType == mDNS.TypeA || qType == mDNS.TypeAAAA) {
+		responseAddrs = r.followCNAMEChain(ctx, rules, domain, qType, options, exchangeResult.response)
+	}
+	return responseAddrs, nil
+}
+
+const maxCNAMEFollowDepth = 8
+
+func (r *Router) followCNAMEChain(ctx context.Context, rules []adapter.DNSRule, domain string, qType uint16, options adapter.DNSQueryOptions, response *mDNS.Msg) []netip.Addr {
+	if chain, ok := ctx.Value(aliasChainContextKey{}).(map[string]struct{}); ok && len(chain) >= maxCNAMEFollowDepth {
+		r.logger.DebugContext(ctx, "cname follow depth exceeded for ", domain)
+		return nil
+	}
+	target := findLastCNAMETarget(mDNS.Fqdn(domain), response.Answer, qType)
+	if target == "" {
+		return nil
+	}
+	aliasCtx, loopDetected := ContextWithAliasResolution(ctx, mDNS.Fqdn(domain), target)
+	if loopDetected {
+		r.logger.DebugContext(ctx, "cname follow loop detected: ", domain, " -> ", FqdnToDomain(target))
+		return nil
+	}
+	r.logger.DebugContext(ctx, "follow cname: ", domain, " -> ", FqdnToDomain(target))
+	chased, err := r.lookupWithRulesType(aliasCtx, rules, FqdnToDomain(target), qType, options)
+	if err != nil {
+		return nil
+	}
+	return chased
 }
 
 type dnsExchangeContext struct {

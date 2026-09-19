@@ -37,6 +37,7 @@ icon: material/alert-decagram
     "optimistic": false, // or {}
     "timeout": "",
     "reverse_mapping": false,
+    "follow_cname": false,
     "allow_resolver_discovery": false,
     "client_subnet": "",
     "fakeip": {}
@@ -159,6 +160,11 @@ DNS 缓存的最大 TTL，单位为秒。
 在响应 DNS 查询后存储 IP 地址的反向映射以为路由目的提供域名。
 
 由于此过程依赖于应用程序在发出请求之前解析域名的行为，因此在 macOS 等 DNS 由系统代理和缓存的环境中可能会出现问题。
+
+#### follow_cname
+
+当查询只拿到裸 CNAME 而没有所查类型的地址时，跟进 CNAME 链（最多 8 跳，
+防环）并合并解析到的地址。默认关闭。
 
 #### allow_resolver_discovery
 

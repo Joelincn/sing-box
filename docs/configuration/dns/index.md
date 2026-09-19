@@ -37,6 +37,7 @@ icon: material/alert-decagram
     "optimistic": false, // or {}
     "timeout": "",
     "reverse_mapping": false,
+    "follow_cname": false,
     "allow_resolver_discovery": false,
     "client_subnet": "",
     "fakeip": {}
@@ -161,6 +162,12 @@ Stores a reverse mapping of IP addresses after responding to a DNS query in orde
 
 Since this process relies on the act of resolving domain names by an application before making a request, it can be
 problematic in environments such as macOS, where DNS is proxied and cached by the system.
+
+#### follow_cname
+
+When a lookup receives a bare CNAME without addresses of the requested type,
+follow the CNAME chain (up to 8 hops, loop-protected) and merge the resolved
+addresses. Disabled by default.
 
 #### allow_resolver_discovery
 

@@ -22,6 +22,7 @@ type RawDNSOptions struct {
 	Final                  string             `json:"final,omitempty" reference:"dns_server"`
 	ReverseMapping         bool               `json:"reverse_mapping,omitempty"`
 	DefaultRejectRcode     *DNSRejectRCode    `json:"default_reject_rcode,omitempty"`
+	FollowCNAME            bool               `json:"follow_cname,omitempty"`
 	AllowResolverDiscovery bool               `json:"allow_resolver_discovery,omitempty"`
 	DNSClientOptions
 }
