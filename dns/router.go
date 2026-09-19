@@ -72,6 +72,9 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		allowResolverDiscovery: options.AllowResolverDiscovery,
 		ruleByUUID:             make(map[string]adapter.DNSRule),
 	}
+	if options.FollowCNAME {
+		router.logger.InfoContext(ctx, "dns follow_cname chase enabled")
+	}
 	if options.DNSClientOptions.IndependentCache {
 		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
 	}
@@ -1351,7 +1354,11 @@ func (r *Router) maybeChaseResponseCNAME(ctx context.Context, message *mDNS.Msg,
 	rules := r.rules
 	r.rulesAccess.RUnlock()
 	merged := response.Copy()
-	merged.Answer = append(merged.Answer, r.chaseResponseCNAME(ctx, rules, message.Question[0].Name, qtype, options, response)...)
+	chased := r.chaseResponseCNAME(ctx, rules, message.Question[0].Name, qtype, options, response)
+	if len(chased) > 0 {
+		r.logger.InfoContext(ctx, "chase response cname: ", FqdnToDomain(message.Question[0].Name), " (+", len(chased), " records)")
+	}
+	merged.Answer = append(merged.Answer, chased...)
 	return merged
 }
 
