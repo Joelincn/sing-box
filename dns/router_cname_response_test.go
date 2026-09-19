@@ -81,3 +81,22 @@ func TestMaybeChaseSkipsFakeIP(t *testing.T) {
 	require.Len(t, merged.Answer, 1)
 	require.Equal(t, int32(0), transport.queries.Load())
 }
+
+func TestExchangeAsyncChasesBareCNAME(t *testing.T) {
+	transport := &chaseScriptTransport{tag: "upstream", handler: func(name string, qtype uint16) []mDNS.RR {
+		if name == "target.example." && qtype == mDNS.TypeAAAA {
+			return []mDNS.RR{chaseAAAA("target.example", "2001:db8::1")}
+		}
+		return nil
+	}}
+	router := chaseTestRouter(true, transport)
+	message := &mDNS.Msg{
+		MsgHdr:   mDNS.MsgHdr{Id: 7, RecursionDesired: true},
+		Question: []mDNS.Question{{Name: "alias.example.", Qtype: mDNS.TypeAAAA, Qclass: mDNS.ClassINET}},
+	}
+	bare := &mDNS.Msg{Question: message.Question}
+	bare.Answer = []mDNS.RR{chaseCNAME("alias.example", "target.example")}
+	merged := router.maybeChaseResponseCNAME(chaseTestContext("alias.example"), message, bare, transport, adapter.DNSQueryOptions{})
+	require.Len(t, merged.Answer, 2)
+	require.IsType(t, &mDNS.AAAA{}, merged.Answer[1])
+}
