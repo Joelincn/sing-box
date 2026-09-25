@@ -261,7 +261,9 @@ type _RemoteHTTPSDNSServerOptions struct {
 }
 
 type GroupDNSServerOptions struct {
-	Servers []string `json:"servers" reference:"dns_server"`
+	Strategy         string   `json:"strategy,omitempty"` // "concurrent" (default) or "round_robin"
+	Servers          []string `json:"servers" reference:"dns_server"`
+	ExcludeThreshold int      `json:"exclude_threshold,omitempty"`
 }
 
 type RemoteHTTPSDNSServerOptions _RemoteHTTPSDNSServerOptions
