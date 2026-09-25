@@ -124,3 +124,63 @@ func TestGroupSkipsFailedMembers(t *testing.T) {
 		}
 	}
 }
+
+func newTestGroupWithOptions(t *testing.T, options option.GroupDNSServerOptions, transports map[string]adapter.DNSTransport) adapter.DNSTransport {
+	t.Helper()
+	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), groupTestManager{transports: transports})
+	group, err := NewGroup(ctx, log.NewNOPFactory().Logger(), "group", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return group
+}
+
+func TestGroupRoundRobinDistributes(t *testing.T) {
+	var callsA, callsB atomic.Int32
+	reply := func(calls *atomic.Int32) func(context.Context, *mDNS.Msg, func(*mDNS.Msg, error)) {
+		return func(_ context.Context, message *mDNS.Msg, callback func(*mDNS.Msg, error)) {
+			calls.Add(1)
+			callback(new(mDNS.Msg).SetReply(message), nil)
+		}
+	}
+	group := newTestGroupWithOptions(t, option.GroupDNSServerOptions{
+		Strategy: "round_robin",
+		Servers:  []string{"a", "b"},
+	}, map[string]adapter.DNSTransport{
+		"a": groupTestTransport{exchange: reply(&callsA)},
+		"b": groupTestTransport{exchange: reply(&callsB)},
+	})
+	for i := 0; i < 4; i++ {
+		response, err := group.Exchange(context.Background(), new(mDNS.Msg).SetQuestion("example.", mDNS.TypeA))
+		if err != nil || response == nil {
+			t.Fatalf("exchange %d: %v, %v", i, response, err)
+		}
+	}
+	if callsA.Load() != 2 || callsB.Load() != 2 {
+		t.Fatalf("expected 2+2 distribution, got a=%d b=%d", callsA.Load(), callsB.Load())
+	}
+}
+
+func TestGroupExcludeThreshold(t *testing.T) {
+	failErr := errors.New("boom")
+	group := newTestGroupWithOptions(t, option.GroupDNSServerOptions{
+		Strategy:         "round_robin",
+		Servers:          []string{"bad", "good"},
+		ExcludeThreshold: 1,
+	}, map[string]adapter.DNSTransport{
+		"bad": groupTestTransport{exchange: func(_ context.Context, _ *mDNS.Msg, callback func(*mDNS.Msg, error)) {
+			callback(nil, failErr)
+		}},
+		"good": groupTestTransport{exchange: func(_ context.Context, message *mDNS.Msg, callback func(*mDNS.Msg, error)) {
+			callback(new(mDNS.Msg).SetReply(message), nil)
+		}},
+	})
+	_, err := group.Exchange(context.Background(), new(mDNS.Msg).SetQuestion("example.", mDNS.TypeA))
+	if !errors.Is(err, failErr) {
+		t.Fatalf("expected failure from bad server, got %v", err)
+	}
+	response, err := group.Exchange(context.Background(), new(mDNS.Msg).SetQuestion("example.", mDNS.TypeA))
+	if err != nil || response == nil {
+		t.Fatalf("expected success from good server, got %v, %v", response, err)
+	}
+}
