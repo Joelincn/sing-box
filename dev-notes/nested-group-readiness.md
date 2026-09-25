@@ -159,3 +159,25 @@ selector 成员保持现状（selector 自身不拨测，key 全靠别人补）�
 - 补丁文件内容级全同，仅中断 API 名沿用 alpha.4（`IsResourceDownload`），
   重放零冲突；`constant/proxy.go`、`include/registry.go` 与上游 tailcat
   钩子位不同行，mieru 钩子干净合入。
+
+## 八、alpha.8 基线升级
+
+- 新基线：`upstream/reF1nd-testing@9fa483461`（`v1.15.0-alpha.8-reF1nd`；
+  上游重写了 `reF1nd-testing` 历史，老基线 `9e5ea2101` 已不在上游线上，
+  等价提交变为 `600a016ea`；旧 mustang 备份 tag `mustang-pre-alpha8`）。
+- 上游结构性变化，自有补丁全部重写而非简单重放：
+  - DNS 组传输被重写为纯 concurrent 实现（`4b2e188d6`），无 strategy、
+    无熔断；round_robin + exclude_threshold 按新结构重写
+    （`dns/transport/group.go`，保留 `StrategyRoundRobin`/`excludeWindow`
+    断言点；`ExchangeAsync` 按策略分流，concurrent 行为与上游一致）。
+  - LB 新增 outbound type loadbalance + provider + fallback
+    （`509bd9d60` 等）；`RealTag` 搬到 `selector.go` 且签名改为
+    `(detour, network)`；熔断/掐断/豁免按新 `aliveForMetadata` 单点接入
+    （`isAvailable(proxy, network)`），`DialContext`/`ListenPacket` 记
+    failure 并包 tracked 连接。
+  - mieru cherry-pick 仅 `include/registry.go` 一处冲突（上游新增
+    `protocol/masque` import 同行），双保留解决；`go.mod`/`go.sum`
+    取新基线 + `go mod tidy` 补 mieru。
+- 构建环境同步 Go 1.26.8（SFA `version.properties` 的 `GO_VERSION` 已先行；
+  本地 `~/go-1.26.8`，发布仓 workflow 同步）。
+- 嵌套补丁保持退役。
