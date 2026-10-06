@@ -159,3 +159,24 @@ selector 成员保持现状（selector 自身不拨测，key 全靠别人补）�
 - 补丁文件内容级全同，仅中断 API 名沿用 alpha.4（`IsResourceDownload`），
   重放零冲突；`constant/proxy.go`、`include/registry.go` 与上游 tailcat
   钩子位不同行，mieru 钩子干净合入。
+
+## 八、alpha.10 基线升级
+
+- 新基线：`upstream/reF1nd-testing@b23f5e683`（`v1.15.0-alpha.10-reF1nd`；
+  上游再次重写历史，旧基线 `9fa483461` 已不在上游线上，旧 mustang 备份
+  tag `mustang-pre-alpha10`）。
+- 补丁 transplant（cherry-pick 到新基线，全部自动合并零冲突）：
+  - mieru：干净合入，随后 `go get` 到 `v3.38.0`（经代理确认已是最新，
+    无线协议改动，与 v3.37.0 服务端互通）。
+  - DNS round_robin：上游 concurrent 实现新增连接隔离
+    （childContext/childMessage）与 ctx.Done 处理，合并后原样保留，
+    策略分流 + 熔断叠加其上。
+  - LB 熔断/掐断/豁免：`RealTag(detour, network)` 签名未变；新基线策略
+    函数经 `aliveForMetadata`（区分 TCP/UDP）判定可用性，自有
+    `isAvailable` 正好卡在其内，连 UDP 一并覆盖。
+- 基线自带问题（与补丁无关）：`experimental/boxdd` 在 Go 1.26.8 下链接
+  失败（`oomprofile` linkname），干净基线同样失败；发布只编
+  `./cmd/sing-box`，不受影响。
+- SFA：`reF1nd-testing` 为 1.15.0-alpha.10、GO 1.26.8，发布仓 workflow
+  （shell_ref=reF1nd-testing，GO 1.26.8）已对齐，无需改动。
+- 嵌套补丁保持退役；`mustang-1.14.0` 未动。
