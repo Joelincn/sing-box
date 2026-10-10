@@ -159,3 +159,21 @@ selector 成员保持现状（selector 自身不拨测，key 全靠别人补）�
 - 补丁文件内容级全同，仅中断 API 名沿用 alpha.4（`IsResourceDownload`），
   重放零冲突；`constant/proxy.go`、`include/registry.go` 与上游 tailcat
   钩子位不同行，mieru 钩子干净合入。
+
+## 九、alpha.11 基线升级
+
+- 新基线：`upstream/reF1nd-testing@78ea0ce92`（`v1.15.0-alpha.11-reF1nd`，
+  即新 tip 本体；上游再次重写历史，旧基线 `b23f5e683` 已不在上游线上，
+  旧 mustang 备份 tag `mustang-pre-alpha11`）。
+- 补丁 transplant（cherry-pick 到新基线，DNS/LB 零冲突自动合并）：
+  - mieru：干净合入；`go get` 到 `v3.38.0`（经代理与 GitHub releases
+    双重确认已是最新），`go mod tidy` 无多余变更。
+  - DNS round_robin：上游 concurrent（含连接隔离与 ctx.Done 处理）原样
+    保留，策略分流 + 熔断叠加其上。
+  - LB 熔断/掐断/豁免：`RealTag(detour, network)` 签名未变；策略函数经
+    `aliveForMetadata`（区分 TCP/UDP）判定，自有 `isAvailable` 卡在其内。
+- SFA：`reF1nd-testing` 为 1.15.0-alpha.11、GO 1.26.8，发布仓 workflow
+  已对齐，无需改动；mieru 库确认无新版。
+- 基线自带问题（与补丁无关）：`experimental/boxdd` 在 Go 1.26.8 下链接
+  失败，干净基线 worktree 同样失败；发布只编 `./cmd/sing-box`。
+- 嵌套补丁保持退役；`mustang-1.14.0` 未动。
